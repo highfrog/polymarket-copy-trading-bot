@@ -6,13 +6,42 @@ import fetchData from '../utils/fetchData';
 import getMyBalance from '../utils/getMyBalance';
 import postOrder from '../utils/postOrder';
 import Logger from '../utils/logger';
+import { calculateOrderSize } from '../config/copyStrategy';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const PROXY_WALLET = ENV.PROXY_WALLET;
 const TRADE_AGGREGATION_ENABLED = ENV.TRADE_AGGREGATION_ENABLED;
-const TRADE_AGGREGATION_WINDOW_SECONDS = ENV.TRADE_AGGREGATION_WINDOW_SECONDS;
-const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
+const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
+
+// Threshold-based aggregation: execute when either threshold is met
+// This eliminates skips - trades aggregate until they can be executed
+const AGGREGATION_TAKER_MIN_TOKENS = 5;   // Taker orders need >= 5 tokens
+const AGGREGATION_MAKER_MIN_USD = 1.00;   // Maker orders need >= $1 USD
+
+// Market filter: only process trades from these markets (empty array = all markets)
+// Matches against trade.slug or trade.eventSlug
+const ALLOWED_MARKETS: string[] = [
+    'btc-updown-15m',
+    'eth-updown-15m',
+    // Add more market slugs here as needed
+];
+
+/**
+ * Check if a trade is from an allowed market
+ */
+const isAllowedMarket = (trade: TradeWithUser): boolean => {
+    // If no filter configured, allow all markets
+    if (ALLOWED_MARKETS.length === 0) return true;
+
+    const tradeSlug = trade.slug?.toLowerCase() || '';
+    const tradeEventSlug = trade.eventSlug?.toLowerCase() || '';
+
+    return ALLOWED_MARKETS.some(market => {
+        const marketLower = market.toLowerCase();
+        return tradeSlug.includes(marketLower) || tradeEventSlug.includes(marketLower);
+    });
+};
 
 // Create activity models for each user
 const userActivityModels = USER_ADDRESSES.map((address) => ({
@@ -22,6 +51,7 @@ const userActivityModels = USER_ADDRESSES.map((address) => ({
 
 interface TradeWithUser extends UserActivityInterface {
     userAddress: string;
+    scaledUsdcSize?: number; // Scaled size based on copy strategy
 }
 
 interface AggregatedTrade {
@@ -32,7 +62,8 @@ interface AggregatedTrade {
     slug?: string;
     eventSlug?: string;
     trades: TradeWithUser[];
-    totalUsdcSize: number;
+    totalRawUsdcSize: number; // Raw trader size (for logging)
+    totalScaledUsdcSize: number; // Scaled size based on copy strategy (for threshold checks)
     averagePrice: number;
     firstTradeTime: number;
     lastTradeTime: number;
@@ -73,19 +104,22 @@ const getAggregationKey = (trade: TradeWithUser): string => {
 
 /**
  * Add trade to aggregation buffer or update existing aggregation
+ * Uses scaledUsdcSize (must be pre-calculated) for threshold tracking
  */
 const addToAggregationBuffer = (trade: TradeWithUser): void => {
     const key = getAggregationKey(trade);
     const existing = tradeAggregationBuffer.get(key);
     const now = Date.now();
+    const scaledSize = trade.scaledUsdcSize ?? trade.usdcSize;
 
     if (existing) {
         // Update existing aggregation
         existing.trades.push(trade);
-        existing.totalUsdcSize += trade.usdcSize;
-        // Recalculate weighted average price
+        existing.totalRawUsdcSize += trade.usdcSize;
+        existing.totalScaledUsdcSize += scaledSize;
+        // Recalculate weighted average price (using raw sizes for price averaging)
         const totalValue = existing.trades.reduce((sum, t) => sum + t.usdcSize * t.price, 0);
-        existing.averagePrice = totalValue / existing.totalUsdcSize;
+        existing.averagePrice = totalValue / existing.totalRawUsdcSize;
         existing.lastTradeTime = now;
     } else {
         // Create new aggregation
@@ -97,7 +131,8 @@ const addToAggregationBuffer = (trade: TradeWithUser): void => {
             slug: trade.slug,
             eventSlug: trade.eventSlug,
             trades: [trade],
-            totalUsdcSize: trade.usdcSize,
+            totalRawUsdcSize: trade.usdcSize,
+            totalScaledUsdcSize: scaledSize,
             averagePrice: trade.price,
             firstTradeTime: now,
             lastTradeTime: now,
@@ -107,38 +142,38 @@ const addToAggregationBuffer = (trade: TradeWithUser): void => {
 
 /**
  * Check buffer and return ready aggregated trades
- * Trades are ready if:
- * 1. Total size >= minimum AND
- * 2. Time window has passed since first trade
+ * Threshold-based triggering: ready when EITHER threshold is met:
+ * 1. Total scaled tokens >= 5 (can execute as taker/FOK)
+ * 2. Total scaled USD >= $1 (can execute as maker with postOnly)
+ *
+ * This eliminates skips - trades keep aggregating until executable
  */
 const getReadyAggregatedTrades = (): AggregatedTrade[] => {
     const ready: AggregatedTrade[] = [];
-    const now = Date.now();
-    const windowMs = TRADE_AGGREGATION_WINDOW_SECONDS * 1000;
 
     for (const [key, agg] of tradeAggregationBuffer.entries()) {
-        const timeElapsed = now - agg.firstTradeTime;
+        // Calculate total scaled tokens from USD and average price
+        const totalScaledTokens = agg.averagePrice > 0
+            ? agg.totalScaledUsdcSize / agg.averagePrice
+            : 0;
 
-        // Check if aggregation is ready
-        if (timeElapsed >= windowMs) {
-            if (agg.totalUsdcSize >= TRADE_AGGREGATION_MIN_TOTAL_USD) {
-                // Aggregation meets minimum and window passed - ready to execute
-                ready.push(agg);
-            } else {
-                // Window passed but total too small - mark individual trades as skipped
-                Logger.info(
-                    `Trade aggregation for ${agg.userAddress} on ${agg.slug || agg.asset}: $${agg.totalUsdcSize.toFixed(2)} total from ${agg.trades.length} trades below minimum ($${TRADE_AGGREGATION_MIN_TOTAL_USD}) - skipping`
-                );
+        // Check if EITHER threshold is met
+        const meetsTokenThreshold = totalScaledTokens >= AGGREGATION_TAKER_MIN_TOKENS;
+        const meetsUsdThreshold = agg.totalScaledUsdcSize >= AGGREGATION_MAKER_MIN_USD;
 
-                // Mark all trades in this aggregation as processed (bot: true)
-                for (const trade of agg.trades) {
-                    const UserActivity = getUserActivityModel(trade.userAddress);
-                    UserActivity.updateOne({ _id: trade._id }, { bot: true }).exec();
-                }
-            }
-            // Remove from buffer either way
+        if (meetsTokenThreshold || meetsUsdThreshold) {
+            const reason = meetsTokenThreshold
+                ? `${totalScaledTokens.toFixed(2)} tokens >= ${AGGREGATION_TAKER_MIN_TOKENS} (taker)`
+                : `$${agg.totalScaledUsdcSize.toFixed(2)} >= $${AGGREGATION_MAKER_MIN_USD} (maker)`;
+
+            Logger.info(
+                `✅ Aggregation ready: ${agg.trades.length} trades on ${agg.slug || agg.asset} | ${reason}`
+            );
+
+            ready.push(agg);
             tradeAggregationBuffer.delete(key);
         }
+        // If neither threshold met, keep in buffer (no skip, no timeout)
     }
 
     return ready;
@@ -146,56 +181,65 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
 
 const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
     for (const trade of trades) {
-        // Mark trade as being processed immediately to prevent duplicate processing
-        const UserActivity = getUserActivityModel(trade.userAddress);
-        await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
+        try {
+            // Mark trade as being processed immediately to prevent duplicate processing
+            const UserActivity = getUserActivityModel(trade.userAddress);
+            await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
 
-        Logger.trade(trade.userAddress, trade.side || 'UNKNOWN', {
-            asset: trade.asset,
-            side: trade.side,
-            amount: trade.usdcSize,
-            price: trade.price,
-            slug: trade.slug,
-            eventSlug: trade.eventSlug,
-            transactionHash: trade.transactionHash,
-        });
+            Logger.trade(trade.userAddress, trade.side || 'UNKNOWN', {
+                asset: trade.asset,
+                side: trade.side,
+                amount: trade.usdcSize,
+                price: trade.price,
+                slug: trade.slug,
+                eventSlug: trade.eventSlug,
+                transactionHash: trade.transactionHash,
+            });
 
-        const my_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
-        );
-        const user_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${trade.userAddress}`
-        );
-        const my_position = my_positions.find(
-            (position: UserPositionInterface) => position.conditionId === trade.conditionId
-        );
-        const user_position = user_positions.find(
-            (position: UserPositionInterface) => position.conditionId === trade.conditionId
-        );
+            const my_positions: UserPositionInterface[] = await fetchData(
+                `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
+            );
+            const user_positions: UserPositionInterface[] = await fetchData(
+                `https://data-api.polymarket.com/positions?user=${trade.userAddress}`
+            );
+            const my_position = my_positions.find(
+                (position: UserPositionInterface) => position.conditionId === trade.conditionId
+            );
+            const user_position = user_positions.find(
+                (position: UserPositionInterface) => position.conditionId === trade.conditionId
+            );
 
-        // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
+            // Get USDC balance
+            const my_balance = await getMyBalance(PROXY_WALLET);
 
-        // Calculate trader's total portfolio value from positions
-        const user_balance = user_positions.reduce((total, pos) => {
-            return total + (pos.currentValue || 0);
-        }, 0);
+            // Calculate trader's total portfolio value from positions
+            const user_balance = user_positions.reduce((total, pos) => {
+                return total + (pos.currentValue || 0);
+            }, 0);
 
-        Logger.balance(my_balance, user_balance, trade.userAddress);
+            Logger.balance(my_balance, user_balance, trade.userAddress);
 
-        // Execute the trade
-        await postOrder(
-            clobClient,
-            trade.side === 'BUY' ? 'buy' : 'sell',
-            my_position,
-            user_position,
-            trade,
-            my_balance,
-            user_balance,
-            trade.userAddress
-        );
+            // Execute the trade
+            await postOrder(
+                clobClient,
+                trade.side === 'BUY' ? 'buy' : 'sell',
+                my_position,
+                user_position,
+                trade,
+                my_balance,
+                user_balance,
+                trade.userAddress
+            );
 
-        Logger.separator();
+            Logger.separator();
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            Logger.warning(`⚠️ Error executing trade: ${errMsg}`);
+            // Mark trade as processed to avoid infinite retry
+            const UserActivity = getUserActivityModel(trade.userAddress);
+            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3s before next
+        }
     }
 };
 
@@ -204,62 +248,74 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
  */
 const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: AggregatedTrade[]) => {
     for (const agg of aggregatedTrades) {
-        Logger.header(`📊 AGGREGATED TRADE (${agg.trades.length} trades combined)`);
-        Logger.info(`Market: ${agg.slug || agg.asset}`);
-        Logger.info(`Side: ${agg.side}`);
-        Logger.info(`Total volume: $${agg.totalUsdcSize.toFixed(2)}`);
-        Logger.info(`Average price: $${agg.averagePrice.toFixed(4)}`);
+        try {
+            Logger.header(`📊 AGGREGATED TRADE (${agg.trades.length} trades combined)`);
+            Logger.info(`Market: ${agg.slug || agg.asset}`);
+            Logger.info(`Side: ${agg.side}`);
+            Logger.info(`Total raw volume: $${agg.totalRawUsdcSize.toFixed(2)} → Scaled: $${agg.totalScaledUsdcSize.toFixed(2)}`);
+            Logger.info(`Average price: $${agg.averagePrice.toFixed(4)}`);
 
-        // Mark all individual trades as being processed
-        for (const trade of agg.trades) {
-            const UserActivity = getUserActivityModel(trade.userAddress);
-            await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
+            // Mark all individual trades as being processed
+            for (const trade of agg.trades) {
+                const UserActivity = getUserActivityModel(trade.userAddress);
+                await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
+            }
+
+            const my_positions: UserPositionInterface[] = await fetchData(
+                `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
+            );
+            const user_positions: UserPositionInterface[] = await fetchData(
+                `https://data-api.polymarket.com/positions?user=${agg.userAddress}`
+            );
+            const my_position = my_positions.find(
+                (position: UserPositionInterface) => position.conditionId === agg.conditionId
+            );
+            const user_position = user_positions.find(
+                (position: UserPositionInterface) => position.conditionId === agg.conditionId
+            );
+
+            // Get USDC balance
+            const my_balance = await getMyBalance(PROXY_WALLET);
+
+            // Calculate trader's total portfolio value from positions
+            const user_balance = user_positions.reduce((total, pos) => {
+                return total + (pos.currentValue || 0);
+            }, 0);
+
+            Logger.balance(my_balance, user_balance, agg.userAddress);
+
+            // Create a synthetic trade object for postOrder
+            const syntheticTrade: UserActivityInterface = {
+                ...agg.trades[0], // Use first trade as template
+                usdcSize: agg.totalRawUsdcSize, // Raw for logging
+                price: agg.averagePrice,
+                side: agg.side as 'BUY' | 'SELL',
+            };
+
+            // Execute the aggregated trade with pre-scaled amount (skip double-scaling)
+            await postOrder(
+                clobClient,
+                agg.side === 'BUY' ? 'buy' : 'sell',
+                my_position,
+                user_position,
+                syntheticTrade,
+                my_balance,
+                user_balance,
+                agg.userAddress,
+                agg.totalScaledUsdcSize // Pass pre-scaled amount to skip calculateOrderSize
+            );
+
+            Logger.separator();
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            Logger.warning(`⚠️ Error executing aggregated trade: ${errMsg}`);
+            // Mark trades as processed anyway to avoid infinite retry
+            for (const trade of agg.trades) {
+                const UserActivity = getUserActivityModel(trade.userAddress);
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            }
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3s before next
         }
-
-        const my_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
-        );
-        const user_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${agg.userAddress}`
-        );
-        const my_position = my_positions.find(
-            (position: UserPositionInterface) => position.conditionId === agg.conditionId
-        );
-        const user_position = user_positions.find(
-            (position: UserPositionInterface) => position.conditionId === agg.conditionId
-        );
-
-        // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
-
-        // Calculate trader's total portfolio value from positions
-        const user_balance = user_positions.reduce((total, pos) => {
-            return total + (pos.currentValue || 0);
-        }, 0);
-
-        Logger.balance(my_balance, user_balance, agg.userAddress);
-
-        // Create a synthetic trade object for postOrder using aggregated values
-        const syntheticTrade: UserActivityInterface = {
-            ...agg.trades[0], // Use first trade as template
-            usdcSize: agg.totalUsdcSize,
-            price: agg.averagePrice,
-            side: agg.side as 'BUY' | 'SELL',
-        };
-
-        // Execute the aggregated trade
-        await postOrder(
-            clobClient,
-            agg.side === 'BUY' ? 'buy' : 'sell',
-            my_position,
-            user_position,
-            syntheticTrade,
-            my_balance,
-            user_balance,
-            agg.userAddress
-        );
-
-        Logger.separator();
     }
 };
 
@@ -276,61 +332,133 @@ export const stopTradeExecutor = () => {
 
 const tradeExecutor = async (clobClient: ClobClient) => {
     Logger.success(`Trade executor ready for ${USER_ADDRESSES.length} trader(s)`);
+    if (ALLOWED_MARKETS.length > 0) {
+        Logger.info(`🎯 Market filter active: ${ALLOWED_MARKETS.join(', ')}`);
+    }
     if (TRADE_AGGREGATION_ENABLED) {
         Logger.info(
-            `Trade aggregation enabled: ${TRADE_AGGREGATION_WINDOW_SECONDS}s window, $${TRADE_AGGREGATION_MIN_TOTAL_USD} minimum`
+            `📊 Threshold-based aggregation: execute when ${AGGREGATION_TAKER_MIN_TOKENS} tokens OR $${AGGREGATION_MAKER_MIN_USD.toFixed(2)} USD reached`
         );
+        Logger.info(`   → No skips: trades accumulate until threshold met`);
     }
 
     let lastCheck = Date.now();
     while (isRunning) {
-        const trades = await readTempTrades();
+        const allTrades = await readTempTrades();
+
+        // Filter trades by allowed markets
+        const trades: TradeWithUser[] = [];
+        const filteredOutTrades: TradeWithUser[] = [];
+
+        for (const trade of allTrades) {
+            if (isAllowedMarket(trade)) {
+                trades.push(trade);
+            } else {
+                filteredOutTrades.push(trade);
+            }
+        }
+
+        // Mark filtered-out trades as processed so they don't reappear
+        if (filteredOutTrades.length > 0) {
+            for (const trade of filteredOutTrades) {
+                const UserActivity = getUserActivityModel(trade.userAddress);
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            }
+            Logger.info(`🚫 Filtered out ${filteredOutTrades.length} trade(s) from non-allowed markets`);
+        }
 
         if (TRADE_AGGREGATION_ENABLED) {
-            // Process with aggregation logic
-            if (trades.length > 0) {
-                Logger.clearLine();
-                Logger.info(
-                    `📥 ${trades.length} new trade${trades.length > 1 ? 's' : ''} detected`
-                );
+            try {
+                // Process with aggregation logic
+                if (trades.length > 0) {
+                    Logger.clearLine();
+                    Logger.info(
+                        `📥 ${trades.length} new trade${trades.length > 1 ? 's' : ''} detected from allowed markets`
+                    );
 
-                // Add trades to aggregation buffer
-                for (const trade of trades) {
-                    // Only aggregate BUY trades below minimum threshold
-                    if (trade.side === 'BUY' && trade.usdcSize < TRADE_AGGREGATION_MIN_TOTAL_USD) {
-                        Logger.info(
-                            `Adding $${trade.usdcSize.toFixed(2)} ${trade.side} trade to aggregation buffer for ${trade.slug || trade.asset}`
+                    // Fetch balances once for scaling calculations
+                    const my_balance = await getMyBalance(PROXY_WALLET);
+                    const my_positions: UserPositionInterface[] = await fetchData(
+                        `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
+                    );
+
+                    // Add ALL BUY trades to aggregation buffer (threshold-based execution)
+                    for (const trade of trades) {
+                        // Calculate scaled size for this trade
+                        const my_position = my_positions.find(
+                            (pos) => pos.conditionId === trade.conditionId
                         );
-                        addToAggregationBuffer(trade);
-                    } else {
-                        // Execute large trades immediately (not aggregated)
-                        Logger.clearLine();
-                        Logger.header(`⚡ IMMEDIATE TRADE (above threshold)`);
-                        await doTrading(clobClient, [trade]);
+                        const currentPositionValue = my_position ? my_position.size * my_position.avgPrice : 0;
+
+                        const orderCalc = calculateOrderSize(
+                            COPY_STRATEGY_CONFIG,
+                            trade.usdcSize,
+                            my_balance,
+                            currentPositionValue
+                        );
+
+                        // Store scaled size on trade for aggregation buffer
+                        trade.scaledUsdcSize = orderCalc.finalAmount;
+
+                        if (trade.side === 'BUY') {
+                            // All BUY trades go to aggregation buffer
+                            const scaledTokens = orderCalc.finalAmount / trade.price;
+                            Logger.info(
+                                `📥 Buffering: $${trade.usdcSize.toFixed(2)} raw → $${orderCalc.finalAmount.toFixed(2)} / ${scaledTokens.toFixed(2)} tokens for ${trade.slug || trade.asset}`
+                            );
+                            // Mark trade as being processed to prevent re-reading on next poll
+                            const UserActivity = getUserActivityModel(trade.userAddress);
+                            await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
+                            addToAggregationBuffer(trade);
+                        } else {
+                            // SELL trades execute immediately (don't aggregate sells)
+                            Logger.clearLine();
+                            Logger.header(`⚡ SELL TRADE`);
+                            await doTrading(clobClient, [trade]);
+                        }
                     }
+                    lastCheck = Date.now();
                 }
-                lastCheck = Date.now();
+
+                // Check for ready aggregated trades
+                const readyAggregations = getReadyAggregatedTrades();
+                if (readyAggregations.length > 0) {
+                    Logger.clearLine();
+                    Logger.header(
+                        `⚡ ${readyAggregations.length} AGGREGATED TRADE${readyAggregations.length > 1 ? 'S' : ''} READY`
+                    );
+                    await doAggregatedTrading(clobClient, readyAggregations);
+                    lastCheck = Date.now();
+                }
+            } catch (err) {
+                // Handle network/timeout errors gracefully - don't crash the loop
+                const errMsg = err instanceof Error ? err.message : String(err);
+                if (errMsg.includes('timeout') || errMsg.includes('ETIMEDOUT') || errMsg.includes('network')) {
+                    Logger.warning(`⚠️ Network timeout - will retry on next cycle`);
+                    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before continuing
+                } else {
+                    Logger.warning(`⚠️ Error processing trades: ${errMsg}`);
+                    await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s
+                }
             }
 
-            // Check for ready aggregated trades
-            const readyAggregations = getReadyAggregatedTrades();
-            if (readyAggregations.length > 0) {
-                Logger.clearLine();
-                Logger.header(
-                    `⚡ ${readyAggregations.length} AGGREGATED TRADE${readyAggregations.length > 1 ? 'S' : ''} READY`
-                );
-                await doAggregatedTrading(clobClient, readyAggregations);
-                lastCheck = Date.now();
-            }
-
-            // Update waiting message
-            if (trades.length === 0 && readyAggregations.length === 0) {
+            // Update waiting message with buffer status
+            if (trades.length === 0) {
                 if (Date.now() - lastCheck > 300) {
                     const bufferedCount = tradeAggregationBuffer.size;
                     if (bufferedCount > 0) {
+                        // Calculate total buffered amounts across all groups
+                        let totalBufferedUsd = 0;
+                        let totalBufferedTokens = 0;
+                        for (const agg of tradeAggregationBuffer.values()) {
+                            totalBufferedUsd += agg.totalScaledUsdcSize;
+                            if (agg.averagePrice > 0) {
+                                totalBufferedTokens += agg.totalScaledUsdcSize / agg.averagePrice;
+                            }
+                        }
                         Logger.waiting(
                             USER_ADDRESSES.length,
-                            `${bufferedCount} trade group(s) pending`
+                            `${bufferedCount} group(s) buffered: $${totalBufferedUsd.toFixed(2)} / ${totalBufferedTokens.toFixed(1)} tokens`
                         );
                     } else {
                         Logger.waiting(USER_ADDRESSES.length);

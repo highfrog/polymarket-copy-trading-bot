@@ -7,14 +7,26 @@ import { calculateOrderSize, getTradeMultiplier } from '../config/copyStrategy';
 
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
+const SKIP_SLIPPAGE_CHECK = ENV.SKIP_SLIPPAGE_CHECK;
 
 // Legacy parameters (for backward compatibility in SELL logic)
 const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
 const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
 
-// Polymarket minimum order sizes
-const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
-const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
+// Polymarket minimum order sizes for GTC orders
+const MIN_ORDER_SIZE_USD = 0.10; // Minimum order size in USD for GTC BUY orders
+const MIN_ORDER_SIZE_TOKENS = 0.10; // Minimum order size in tokens for GTC SELL/MERGE orders
+
+// Polymarket decimal precision limits - use string conversion to avoid floating point issues
+const roundToDecimals = (value: number, decimals: number): number => {
+    const factor = Math.pow(10, decimals);
+    const rounded = Math.floor(value * factor) / factor;
+    // Convert to string and back to eliminate floating point artifacts
+    return parseFloat(rounded.toFixed(decimals));
+};
+const roundAmount = (amount: number): number => roundToDecimals(amount, 2); // Taker/USD amounts: 2 decimals
+const roundTokens = (tokens: number): number => roundToDecimals(tokens, 4); // Maker/token amounts: 4 decimals
+const roundPrice = (price: number): number => roundToDecimals(price, 2); // Prices: 2 decimals
 
 const extractOrderError = (response: unknown): string | undefined => {
     if (!response) {
@@ -71,7 +83,8 @@ const postOrder = async (
     trade: UserActivityInterface,
     my_balance: number,
     user_balance: number,
-    userAddress: string
+    userAddress: string,
+    preScaledAmount?: number // Optional: skip scaling if provided (for aggregated trades)
 ) => {
     const UserActivity = getUserActivityModel(userAddress);
     //Merge strategy
@@ -82,12 +95,12 @@ const postOrder = async (
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return;
         }
-        let remaining = my_position.size;
+        let remaining = roundTokens(my_position.size); // Round to 5 decimals
 
         // Check minimum order size
         if (remaining < MIN_ORDER_SIZE_TOKENS) {
             Logger.warning(
-                `Position size (${remaining.toFixed(2)} tokens) too small to merge - skipping`
+                `Position size (${remaining.toFixed(4)} tokens) too small to merge - skipping`
             );
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return;
@@ -113,20 +126,20 @@ const postOrder = async (
                 order_arges = {
                     side: Side.SELL,
                     tokenID: my_position.asset,
-                    amount: remaining,
-                    price: parseFloat(maxPriceBid.price),
+                    amount: roundTokens(remaining), // Round to 5 decimals
+                    price: roundPrice(parseFloat(maxPriceBid.price)),
                 };
             } else {
                 order_arges = {
                     side: Side.SELL,
                     tokenID: my_position.asset,
-                    amount: parseFloat(maxPriceBid.size),
-                    price: parseFloat(maxPriceBid.price),
+                    amount: roundTokens(parseFloat(maxPriceBid.size)), // Round to 5 decimals
+                    price: roundPrice(parseFloat(maxPriceBid.price)),
                 };
             }
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
-            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            const resp = await clobClient.postOrder(signedOrder, OrderType.GTC);
             if (resp.success === true) {
                 retry = 0;
                 Logger.orderResult(
@@ -166,36 +179,42 @@ const postOrder = async (
         }
     } else if (condition === 'buy') {
         //Buy strategy
-        Logger.info('Executing BUY strategy...');
+        Logger.info(`Executing BUY strategy... (slippage check: ${SKIP_SLIPPAGE_CHECK ? 'DISABLED' : 'enabled'})`);
 
         Logger.info(`Your balance: $${my_balance.toFixed(2)}`);
         Logger.info(`Trader bought: $${trade.usdcSize.toFixed(2)}`);
 
-        // Get current position size for position limit checks
-        const currentPositionValue = my_position ? my_position.size * my_position.avgPrice : 0;
+        let remaining: number;
 
-        // Use new copy strategy system
-        const orderCalc = calculateOrderSize(
-            COPY_STRATEGY_CONFIG,
-            trade.usdcSize,
-            my_balance,
-            currentPositionValue
-        );
+        // If preScaledAmount provided (aggregated trade), use it directly
+        if (preScaledAmount !== undefined) {
+            remaining = roundAmount(preScaledAmount); // Round to 2 decimals
+            Logger.info(`📊 Using pre-scaled amount: $${remaining.toFixed(2)} (aggregated trade)`);
+        } else {
+            // Get current position size for position limit checks
+            const currentPositionValue = my_position ? my_position.size * my_position.avgPrice : 0;
 
-        // Log the calculation reasoning
-        Logger.info(`📊 ${orderCalc.reasoning}`);
+            // Use new copy strategy system
+            const orderCalc = calculateOrderSize(
+                COPY_STRATEGY_CONFIG,
+                trade.usdcSize,
+                my_balance,
+                currentPositionValue
+            );
 
-        // Check if order should be executed
-        if (orderCalc.finalAmount === 0) {
-            Logger.warning(`❌ Cannot execute: ${orderCalc.reasoning}`);
+            // Log the calculation reasoning
+            Logger.info(`📊 ${orderCalc.reasoning}`);
+
+            // Check if order should be executed
             if (orderCalc.belowMinimum) {
+                Logger.warning(`❌ Cannot execute: ${orderCalc.reasoning}`);
                 Logger.warning(`💡 Increase COPY_SIZE or wait for larger trades`);
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                return;
             }
-            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
-        }
 
-        let remaining = orderCalc.finalAmount;
+            remaining = roundAmount(orderCalc.finalAmount); // Round to 2 decimals
+        }
 
         let retry = 0;
         let abortDueToFunds = false;
@@ -214,10 +233,16 @@ const postOrder = async (
             }, orderBook.asks[0]);
 
             Logger.info(`Best ask: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
-            if (parseFloat(minPriceAsk.price) - 0.05 > trade.price) {
-                Logger.warning('Price slippage too high - skipping trade');
-                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-                break;
+
+            // Slippage check: skip if best ask is too far above trader's price
+            // Can be disabled via SKIP_SLIPPAGE_CHECK=true for GTC maker orders
+            if (!SKIP_SLIPPAGE_CHECK) {
+                const maxAcceptablePrice = trade.price * 1.10;  // 10% above trader's price
+                if (parseFloat(minPriceAsk.price) > maxAcceptablePrice) {
+                    Logger.warning(`Price slippage too high: best ask $${minPriceAsk.price} > max $${maxAcceptablePrice.toFixed(2)} - skipping`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
             }
 
             // Check if remaining amount is below minimum before creating order
@@ -232,31 +257,162 @@ const postOrder = async (
                 break;
             }
 
-            const maxOrderSize = parseFloat(minPriceAsk.size) * parseFloat(minPriceAsk.price);
-            const orderSize = Math.min(remaining, maxOrderSize);
+            // Use trader's execution price to ensure order is a maker (sits on book)
+            // Taker orders need 5 tokens min, Maker orders need $1.00 USD min
+            const traderPrice = roundPrice(trade.price);
+            const bestAskPrice = roundPrice(parseFloat(minPriceAsk.price));
 
-            const order_arges = {
-                side: Side.BUY,
-                tokenID: trade.asset,
-                amount: orderSize,
-                price: parseFloat(minPriceAsk.price),
-            };
+            // Polymarket minimum sizes:
+            // - Taker orders (price >= best ask): minimum 5 tokens
+            // - Maker orders (price < best ask): minimum $1.00 USD
+            const TAKER_MIN_TOKENS = 5;
+            const MAKER_MIN_USD = 1.00;
 
-            Logger.info(
-                `Creating order: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (Balance: $${my_balance.toFixed(2)})`
-            );
-            // Order args logged internally
-            const signedOrder = await clobClient.createMarketOrder(order_arges);
-            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            // Calculate approximate tokens and USD
+            const approxTokens = remaining / traderPrice;
+            const approxUsd = remaining;
+
+            // Order strategy for arb trading:
+            // - FOK for >= $1 USD: Fast execution at best ask (marketable, needs $1 min)
+            // - GTC for >= 5 tokens but < $1 USD: Price BELOW best ask to sit on book (maker, needs 5 token min)
+            // - Below both: shouldn't happen with threshold aggregation
+            let price: number;
+            let useFOK = false;
+
+            if (approxUsd >= MAKER_MIN_USD) {
+                // >= $1 USD: Use FOK for fast arb execution at best available price
+                useFOK = true;
+                price = bestAskPrice;  // Best available price for immediate fill
+                Logger.info(`⚡ FOK order: $${approxUsd.toFixed(2)} >= $${MAKER_MIN_USD} | fast execution @ best ask $${bestAskPrice.toFixed(2)}`);
+            } else if (approxTokens >= TAKER_MIN_TOKENS) {
+                // >= 5 tokens but < $1 USD: Price BELOW best ask to be a maker (not marketable)
+                // Use 2% buffer or $0.01, whichever is larger, to ensure we're below best ask
+                const buffer = Math.max(0.01, bestAskPrice * 0.02);
+                const makerPrice = roundPrice(bestAskPrice - buffer);
+                // Use lower of trader's price or our calculated maker price
+                price = Math.min(traderPrice, makerPrice);
+                // Ensure we're definitely below best ask
+                if (price >= bestAskPrice) {
+                    price = roundPrice(bestAskPrice - 0.01);
+                }
+                Logger.info(`📋 GTC maker: ${approxTokens.toFixed(2)} tokens >= ${TAKER_MIN_TOKENS}, $${approxUsd.toFixed(2)} < $${MAKER_MIN_USD} | price $${price.toFixed(2)} < best ask $${bestAskPrice.toFixed(2)}`);
+            } else {
+                // Below both minimums - should not happen with threshold-based aggregation
+                Logger.warning(`Order too small: ${approxTokens.toFixed(2)} tokens < ${TAKER_MIN_TOKENS} AND $${approxUsd.toFixed(2)} < $${MAKER_MIN_USD}`);
+                Logger.warning(`This should not happen - check aggregation thresholds`);
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
+            }
+
+            // PRECISION RULES (opposite for market vs limit orders!):
+            // - FOK (market): USD max 2 decimals, tokens max 4 decimals
+            // - GTC (limit):  USD max 4 decimals, tokens max 2 decimals
+
+            // Step 1: Price as integer cents → clean 2-decimal float
+            const priceCents = Math.round(price * 100);
+            const priceStr = (priceCents / 100).toFixed(2);
+            const finalPrice = parseFloat(priceStr);
+
+            let finalTokens: number;
+            let finalUsdCost: number;
+            let tokensStr: string;
+            let usdStr: string;
+
+            if (useFOK) {
+                // FOK: USD must be 2 decimals, tokens can be 4 decimals
+                const usdCents = Math.floor(remaining * 100);
+                usdStr = (usdCents / 100).toFixed(2);
+                finalUsdCost = parseFloat(usdStr);
+
+                // Tokens = USD / price (can have 4 decimals)
+                const tokensRaw = finalUsdCost / finalPrice;
+                const tokensTenThousandths = Math.floor(tokensRaw * 10000);
+                tokensStr = (tokensTenThousandths / 10000).toFixed(4);
+                finalTokens = parseFloat(tokensStr);
+            } else {
+                // GTC: Tokens must be 2 decimals, USD can be 4 decimals
+                const tokensCents = Math.floor(remaining * 10000 / priceCents);
+                tokensStr = (tokensCents / 100).toFixed(2);
+                finalTokens = parseFloat(tokensStr);
+
+                // USD = tokens * price (can have 4 decimals)
+                const usdTenThousandths = tokensCents * priceCents;
+                usdStr = (usdTenThousandths / 10000).toFixed(4);
+                finalUsdCost = parseFloat(usdStr);
+            }
+
+            Logger.info(`Order: $${usdStr} for ${tokensStr} tokens @ $${priceStr}`);
+
+            // Skip if rounding resulted in zero tokens
+            if (finalTokens === 0) {
+                Logger.info(`Order too small after rounding - completing trade`);
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { bot: true, myBoughtSize: totalBoughtTokens }
+                );
+                break;
+            }
+
+            let signedOrder;
+            let resp;
+
+            try {
+                if (useFOK) {
+                    // FOK: Use createMarketOrder with amount (USD, 2 decimals)
+                    const order_args = {
+                        side: Side.BUY,
+                        tokenID: trade.asset,
+                        amount: finalUsdCost,  // USD rounded to 2 decimals
+                        price: finalPrice,
+                    };
+                    Logger.info(`Creating FOK market order: amount=$${finalUsdCost}, price=$${finalPrice}`);
+                    signedOrder = await clobClient.createMarketOrder(order_args);
+                } else {
+                    // GTC: Use createOrder with size (tokens, 2 decimals)
+                    const order_args = {
+                        side: Side.BUY,
+                        tokenID: trade.asset,
+                        size: finalTokens,   // Tokens rounded to 2 decimals
+                        price: finalPrice,
+                    };
+                    Logger.info(`Creating GTC limit order: size=${finalTokens} tokens, price=$${finalPrice}`);
+                    signedOrder = await clobClient.createOrder(order_args, { tickSize: "0.01" as const });
+                }
+
+                const orderType = useFOK ? OrderType.FOK : OrderType.GTC;
+                resp = await clobClient.postOrder(signedOrder, orderType);
+            } catch (err) {
+                // Handle CLOB client errors (network issues, etc.)
+                const errMsg = err instanceof Error ? err.message : String(err);
+                Logger.warning(`CLOB client error: ${errMsg}`);
+
+                // Check for network/connection errors
+                if (errMsg.toLowerCase().includes('network') ||
+                    errMsg.toLowerCase().includes('timeout') ||
+                    errMsg.toLowerCase().includes('econnreset') ||
+                    errMsg.toLowerCase().includes('socket') ||
+                    errMsg.toLowerCase().includes('fetch')) {
+                    Logger.warning(`Network error - waiting 3s before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    retry += 1;
+                    continue;
+                }
+
+                // For other errors, increment retry and continue
+                retry += 1;
+                if (retry < RETRY_LIMIT) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                continue;
+            }
             if (resp.success === true) {
                 retry = 0;
-                const tokensBought = order_arges.amount / order_arges.price;
-                totalBoughtTokens += tokensBought;
+                totalBoughtTokens += finalTokens;
                 Logger.orderResult(
                     true,
-                    `Bought $${order_arges.amount.toFixed(2)} at $${order_arges.price} (${tokensBought.toFixed(2)} tokens)`
+                    `Bought ${tokensStr} tokens at $${priceStr} ($${usdStr})`
                 );
-                remaining -= order_arges.amount;
+                remaining -= finalUsdCost;
             } else {
                 const errorMessage = extractOrderError(resp);
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
@@ -269,10 +425,48 @@ const postOrder = async (
                     );
                     break;
                 }
+
+                // Check if it's a size minimum error (< 5 tokens for taker)
+                const isSizeMinError = errorMessage?.includes('lower than the minimum: 5');
+                if (isSizeMinError) {
+                    Logger.warning(`Order size ${finalTokens} tokens below 5 token minimum.`);
+                    Logger.warning(`This shouldn't happen - check aggregation thresholds.`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
+
+                // Check for decimal precision errors (shouldn't happen with our rounding)
+                const isDecimalError = errorMessage?.includes('decimal') || errorMessage?.includes('accuracy');
+                if (isDecimalError) {
+                    Logger.warning(`Decimal precision error - tokens: ${finalTokens}, price: ${finalPrice}`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
+
+                // Check for rate limit / network errors - back off before retrying
+                const isRateLimitError = errorMessage?.toLowerCase().includes('rate') ||
+                                         errorMessage?.toLowerCase().includes('limit') ||
+                                         errorMessage?.toLowerCase().includes('too many');
+                const isNetworkError = errorMessage?.toLowerCase().includes('network') ||
+                                       errorMessage?.toLowerCase().includes('timeout') ||
+                                       errorMessage?.toLowerCase().includes('econnreset') ||
+                                       errorMessage?.toLowerCase().includes('socket');
+
+                if (isRateLimitError || isNetworkError) {
+                    const delay = isRateLimitError ? 5000 : 2000;  // 5s for rate limit, 2s for network
+                    Logger.warning(`${isRateLimitError ? 'Rate limited' : 'Network error'} - waiting ${delay/1000}s before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+
                 retry += 1;
                 Logger.warning(
                     `Order failed (attempt ${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
+
+                // Small delay between retries to avoid hammering the API
+                if (retry < RETRY_LIMIT) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
         }
         if (abortDueToFunds) {
@@ -332,9 +526,9 @@ const postOrder = async (
 
         if (!user_position) {
             // Trader sold entire position - we sell entire position too
-            remaining = my_position.size;
+            remaining = roundTokens(my_position.size); // Round to 5 decimals
             Logger.info(
-                `Trader closed entire position → Selling all your ${remaining.toFixed(2)} tokens`
+                `Trader closed entire position → Selling all your ${remaining.toFixed(4)} tokens`
             );
         } else {
             // Calculate the % of position the trader is selling
@@ -364,11 +558,11 @@ const postOrder = async (
 
             // Apply tiered or single multiplier based on trader's order size (symmetrical with BUY logic)
             const multiplier = getTradeMultiplier(COPY_STRATEGY_CONFIG, trade.usdcSize);
-            remaining = baseSellSize * multiplier;
+            remaining = roundTokens(baseSellSize * multiplier); // Round to 5 decimals
 
             if (multiplier !== 1.0) {
                 Logger.info(
-                    `Applying ${multiplier}x multiplier (based on trader's $${trade.usdcSize.toFixed(2)} order): ${baseSellSize.toFixed(2)} → ${remaining.toFixed(2)} tokens`
+                    `Applying ${multiplier}x multiplier (based on trader's $${trade.usdcSize.toFixed(2)} order): ${baseSellSize.toFixed(2)} → ${remaining.toFixed(4)} tokens`
                 );
             }
         }
@@ -376,7 +570,7 @@ const postOrder = async (
         // Check minimum order size
         if (remaining < MIN_ORDER_SIZE_TOKENS) {
             Logger.warning(
-                `❌ Cannot execute: Sell amount ${remaining.toFixed(2)} tokens below minimum (${MIN_ORDER_SIZE_TOKENS} token)`
+                `❌ Cannot execute: Sell amount ${remaining.toFixed(4)} tokens below minimum (${MIN_ORDER_SIZE_TOKENS} token)`
             );
             Logger.warning(`💡 This happens when position sizes are too small or mismatched`);
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -386,10 +580,10 @@ const postOrder = async (
         // Cap sell amount to available position size
         if (remaining > my_position.size) {
             Logger.warning(
-                `⚠️  Calculated sell ${remaining.toFixed(2)} tokens > Your position ${my_position.size.toFixed(2)} tokens`
+                `⚠️  Calculated sell ${remaining.toFixed(4)} tokens > Your position ${my_position.size.toFixed(4)} tokens`
             );
-            Logger.warning(`Capping to maximum available: ${my_position.size.toFixed(2)} tokens`);
-            remaining = my_position.size;
+            Logger.warning(`Capping to maximum available: ${my_position.size.toFixed(4)} tokens`);
+            remaining = roundTokens(my_position.size); // Round to 5 decimals
         }
 
         let retry = 0;
@@ -419,12 +613,12 @@ const postOrder = async (
                 break;
             }
 
-            const sellAmount = Math.min(remaining, parseFloat(maxPriceBid.size));
+            const sellAmount = roundTokens(Math.min(remaining, parseFloat(maxPriceBid.size))); // Round to 5 decimals
 
             // Final check: don't create orders below minimum
             if (sellAmount < MIN_ORDER_SIZE_TOKENS) {
                 Logger.info(
-                    `Order amount (${sellAmount.toFixed(2)} tokens) below minimum - completing trade`
+                    `Order amount (${sellAmount.toFixed(4)} tokens) below minimum - completing trade`
                 );
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -434,11 +628,11 @@ const postOrder = async (
                 side: Side.SELL,
                 tokenID: trade.asset,
                 amount: sellAmount,
-                price: parseFloat(maxPriceBid.price),
+                price: roundPrice(parseFloat(maxPriceBid.price)),
             };
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
-            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            const resp = await clobClient.postOrder(signedOrder, OrderType.GTC);
             if (resp.success === true) {
                 retry = 0;
                 totalSoldTokens += order_arges.amount;

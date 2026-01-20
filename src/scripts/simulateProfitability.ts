@@ -80,7 +80,7 @@ interface SimulatedPosition {
     }[];
 }
 
-const DEFAULT_TRADER_ADDRESS = '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b';
+const DEFAULT_TRADER_ADDRESS = '0xa8c63F775DDbbE66B56614191747Def3021444E8';
 const TRADER_ADDRESS = (process.env.SIM_TRADER_ADDRESS || DEFAULT_TRADER_ADDRESS).toLowerCase();
 const STARTING_CAPITAL = 1000; // Simulation with $1000 starting capital
 const HISTORY_DAYS = (() => {

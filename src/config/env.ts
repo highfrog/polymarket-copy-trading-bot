@@ -248,7 +248,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
             strategy: CopyStrategy.PERCENTAGE,
             copySize: effectivePercentage,
             maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
-            minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
+            minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '0.10'),
             maxPositionSizeUSD: process.env.MAX_POSITION_SIZE_USD
                 ? parseFloat(process.env.MAX_POSITION_SIZE_USD)
                 : undefined,
@@ -282,7 +282,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
         strategy,
         copySize: parseFloat(process.env.COPY_SIZE || '10.0'),
         maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
-        minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
+        minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '0.10'),
         maxPositionSizeUSD: process.env.MAX_POSITION_SIZE_USD
             ? parseFloat(process.env.MAX_POSITION_SIZE_USD)
             : undefined,
@@ -345,6 +345,8 @@ export const ENV = {
         process.env.TRADE_AGGREGATION_WINDOW_SECONDS || '300',
         10
     ), // 5 minutes default
+    // Skip slippage check for GTC maker orders (useful for arb trading)
+    SKIP_SLIPPAGE_CHECK: process.env.SKIP_SLIPPAGE_CHECK === 'true',
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,

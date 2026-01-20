@@ -21,8 +21,8 @@ const isNetworkError = (error: unknown): boolean => {
 
 const fetchData = async (url: string) => {
     const retries = ENV.NETWORK_RETRY_LIMIT;
-    const timeout = ENV.REQUEST_TIMEOUT_MS;
-    const retryDelay = 1000; // 1 second base delay
+    const timeout = Math.max(ENV.REQUEST_TIMEOUT_MS, 20000); // Minimum 20s timeout
+    const retryDelay = 2000; // 2 second base delay
 
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
