@@ -142,11 +142,10 @@ const addToAggregationBuffer = (trade: TradeWithUser): void => {
 
 /**
  * Check buffer and return ready aggregated trades
- * Threshold-based triggering: ready when EITHER threshold is met:
- * 1. Total scaled tokens >= 5 (can execute as taker/FOK)
- * 2. Total scaled USD >= $1 (can execute as maker with postOnly)
+ * Threshold-based triggering: ready when token threshold is met:
+ * - Total scaled tokens >= 5 (required for GTC limit orders)
  *
- * This eliminates skips - trades keep aggregating until executable
+ * Trades keep aggregating until 5 token minimum is reached
  */
 const getReadyAggregatedTrades = (): AggregatedTrade[] => {
     const ready: AggregatedTrade[] = [];
@@ -157,23 +156,16 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
             ? agg.totalScaledUsdcSize / agg.averagePrice
             : 0;
 
-        // Check if EITHER threshold is met
-        const meetsTokenThreshold = totalScaledTokens >= AGGREGATION_TAKER_MIN_TOKENS;
-        const meetsUsdThreshold = agg.totalScaledUsdcSize >= AGGREGATION_MAKER_MIN_USD;
-
-        if (meetsTokenThreshold || meetsUsdThreshold) {
-            const reason = meetsTokenThreshold
-                ? `${totalScaledTokens.toFixed(2)} tokens >= ${AGGREGATION_TAKER_MIN_TOKENS} (taker)`
-                : `$${agg.totalScaledUsdcSize.toFixed(2)} >= $${AGGREGATION_MAKER_MIN_USD} (maker)`;
-
+        // Only trigger when token threshold is met (5 token minimum for orders)
+        if (totalScaledTokens >= AGGREGATION_TAKER_MIN_TOKENS) {
             Logger.info(
-                `✅ Aggregation ready: ${agg.trades.length} trades on ${agg.slug || agg.asset} | ${reason}`
+                `✅ Aggregation ready: ${agg.trades.length} trades on ${agg.slug || agg.asset} | ${totalScaledTokens.toFixed(2)} tokens >= ${AGGREGATION_TAKER_MIN_TOKENS}`
             );
 
             ready.push(agg);
             tradeAggregationBuffer.delete(key);
         }
-        // If neither threshold met, keep in buffer (no skip, no timeout)
+        // If threshold not met, keep in buffer until more trades arrive
     }
 
     return ready;
@@ -337,9 +329,9 @@ const tradeExecutor = async (clobClient: ClobClient) => {
     }
     if (TRADE_AGGREGATION_ENABLED) {
         Logger.info(
-            `📊 Threshold-based aggregation: execute when ${AGGREGATION_TAKER_MIN_TOKENS} tokens OR $${AGGREGATION_MAKER_MIN_USD.toFixed(2)} USD reached`
+            `📊 Threshold-based aggregation: execute when >= ${AGGREGATION_TAKER_MIN_TOKENS} tokens reached`
         );
-        Logger.info(`   → No skips: trades accumulate until threshold met`);
+        Logger.info(`   → Trades accumulate until 5 token minimum met`);
     }
 
     let lastCheck = Date.now();

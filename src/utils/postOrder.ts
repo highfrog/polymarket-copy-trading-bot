@@ -272,41 +272,32 @@ const postOrder = async (
             const approxTokens = remaining / traderPrice;
             const approxUsd = remaining;
 
-            // Order strategy for arb trading:
-            // - FOK for >= $1 USD: Fast execution at best ask (marketable, needs $1 min)
-            // - GTC for >= 5 tokens but < $1 USD: Price BELOW best ask to sit on book (maker, needs 5 token min)
-            // - Below both: shouldn't happen with threshold aggregation
+            // Order strategy: GTC limit orders at trader's VWAP to preserve edge
+            // - Always use GTC maker orders priced at or below trader's fill price
+            // - This avoids paying the spread on every trade
+            // - Minimum: 5 tokens required for GTC orders
             let price: number;
-            let useFOK = false;
 
-            if (approxUsd >= MAKER_MIN_USD) {
-                // >= $1 USD: Use FOK for fast arb execution at best available price
-                useFOK = true;
-                price = bestAskPrice;  // Best available price for immediate fill
-                Logger.info(`⚡ FOK order: $${approxUsd.toFixed(2)} >= $${MAKER_MIN_USD} | fast execution @ best ask $${bestAskPrice.toFixed(2)}`);
-            } else if (approxTokens >= TAKER_MIN_TOKENS) {
-                // >= 5 tokens but < $1 USD: Price BELOW best ask to be a maker (not marketable)
-                // Use 2% buffer or $0.01, whichever is larger, to ensure we're below best ask
-                const buffer = Math.max(0.01, bestAskPrice * 0.02);
-                const makerPrice = roundPrice(bestAskPrice - buffer);
-                // Use lower of trader's price or our calculated maker price
-                price = Math.min(traderPrice, makerPrice);
-                // Ensure we're definitely below best ask
+            if (approxTokens >= TAKER_MIN_TOKENS) {
+                // Use trader's VWAP as our limit price (preserves edge vs paying spread)
+                // Ensure we're at or below best ask to be a maker (sit on book)
+                price = Math.min(traderPrice, bestAskPrice);
+                // If at best ask, step back 1 cent to guarantee maker status
                 if (price >= bestAskPrice) {
                     price = roundPrice(bestAskPrice - 0.01);
                 }
-                Logger.info(`📋 GTC maker: ${approxTokens.toFixed(2)} tokens >= ${TAKER_MIN_TOKENS}, $${approxUsd.toFixed(2)} < $${MAKER_MIN_USD} | price $${price.toFixed(2)} < best ask $${bestAskPrice.toFixed(2)}`);
+                Logger.info(`📋 GTC limit @ VWAP: ${approxTokens.toFixed(2)} tokens ($${approxUsd.toFixed(2)}) | price $${price.toFixed(2)} (trader VWAP: $${traderPrice.toFixed(2)}, best ask: $${bestAskPrice.toFixed(2)})`);
             } else {
-                // Below both minimums - should not happen with threshold-based aggregation
-                Logger.warning(`Order too small: ${approxTokens.toFixed(2)} tokens < ${TAKER_MIN_TOKENS} AND $${approxUsd.toFixed(2)} < $${MAKER_MIN_USD}`);
+                // Below 5 token minimum - should not happen with threshold-based aggregation
+                Logger.warning(`Order too small: ${approxTokens.toFixed(2)} tokens < ${TAKER_MIN_TOKENS} minimum`);
                 Logger.warning(`This should not happen - check aggregation thresholds`);
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
             }
 
-            // PRECISION RULES (opposite for market vs limit orders!):
-            // - FOK (market): USD max 2 decimals, tokens max 4 decimals
-            // - GTC (limit):  USD max 4 decimals, tokens max 2 decimals
+            // PRECISION RULES for GTC limit orders:
+            // - Tokens: max 2 decimals
+            // - USD: max 4 decimals
 
             // Step 1: Price as integer cents → clean 2-decimal float
             const priceCents = Math.round(price * 100);
@@ -318,28 +309,15 @@ const postOrder = async (
             let tokensStr: string;
             let usdStr: string;
 
-            if (useFOK) {
-                // FOK: USD must be 2 decimals, tokens can be 4 decimals
-                const usdCents = Math.floor(remaining * 100);
-                usdStr = (usdCents / 100).toFixed(2);
-                finalUsdCost = parseFloat(usdStr);
+            // GTC: Tokens must be 2 decimals, USD can be 4 decimals
+            const tokensCents = Math.floor(remaining * 10000 / priceCents);
+            tokensStr = (tokensCents / 100).toFixed(2);
+            finalTokens = parseFloat(tokensStr);
 
-                // Tokens = USD / price (can have 4 decimals)
-                const tokensRaw = finalUsdCost / finalPrice;
-                const tokensTenThousandths = Math.floor(tokensRaw * 10000);
-                tokensStr = (tokensTenThousandths / 10000).toFixed(4);
-                finalTokens = parseFloat(tokensStr);
-            } else {
-                // GTC: Tokens must be 2 decimals, USD can be 4 decimals
-                const tokensCents = Math.floor(remaining * 10000 / priceCents);
-                tokensStr = (tokensCents / 100).toFixed(2);
-                finalTokens = parseFloat(tokensStr);
-
-                // USD = tokens * price (can have 4 decimals)
-                const usdTenThousandths = tokensCents * priceCents;
-                usdStr = (usdTenThousandths / 10000).toFixed(4);
-                finalUsdCost = parseFloat(usdStr);
-            }
+            // USD = tokens * price (can have 4 decimals)
+            const usdTenThousandths = tokensCents * priceCents;
+            usdStr = (usdTenThousandths / 10000).toFixed(4);
+            finalUsdCost = parseFloat(usdStr);
 
             Logger.info(`Order: $${usdStr} for ${tokensStr} tokens @ $${priceStr}`);
 
@@ -357,30 +335,16 @@ const postOrder = async (
             let resp;
 
             try {
-                if (useFOK) {
-                    // FOK: Use createMarketOrder with amount (USD, 2 decimals)
-                    const order_args = {
-                        side: Side.BUY,
-                        tokenID: trade.asset,
-                        amount: finalUsdCost,  // USD rounded to 2 decimals
-                        price: finalPrice,
-                    };
-                    Logger.info(`Creating FOK market order: amount=$${finalUsdCost}, price=$${finalPrice}`);
-                    signedOrder = await clobClient.createMarketOrder(order_args);
-                } else {
-                    // GTC: Use createOrder with size (tokens, 2 decimals)
-                    const order_args = {
-                        side: Side.BUY,
-                        tokenID: trade.asset,
-                        size: finalTokens,   // Tokens rounded to 2 decimals
-                        price: finalPrice,
-                    };
-                    Logger.info(`Creating GTC limit order: size=${finalTokens} tokens, price=$${finalPrice}`);
-                    signedOrder = await clobClient.createOrder(order_args, { tickSize: "0.01" as const });
-                }
-
-                const orderType = useFOK ? OrderType.FOK : OrderType.GTC;
-                resp = await clobClient.postOrder(signedOrder, orderType);
+                // GTC limit order at trader's VWAP (maker order, preserves edge)
+                const order_args = {
+                    side: Side.BUY,
+                    tokenID: trade.asset,
+                    size: finalTokens,   // Tokens rounded to 2 decimals
+                    price: finalPrice,
+                };
+                Logger.info(`Creating GTC limit order: size=${finalTokens} tokens, price=$${finalPrice}`);
+                signedOrder = await clobClient.createOrder(order_args, { tickSize: "0.01" as const });
+                resp = await clobClient.postOrder(signedOrder, OrderType.GTC);
             } catch (err) {
                 // Handle CLOB client errors (network issues, etc.)
                 const errMsg = err instanceof Error ? err.message : String(err);
