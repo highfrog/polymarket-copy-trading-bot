@@ -1,12 +1,10 @@
 import connectDB, { closeDB } from './config/db';
 import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
-import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
-import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
+import arbExecutor, { stopArbExecutor } from './services/arbExecutor';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const PROXY_WALLET = ENV.PROXY_WALLET;
 
 // Graceful shutdown handler
@@ -24,8 +22,7 @@ const gracefulShutdown = async (signal: string) => {
 
     try {
         // Stop services
-        stopTradeMonitor();
-        stopTradeExecutor();
+        stopArbExecutor();
 
         // Give services time to finish current operations
         Logger.info('Waiting for services to finish current operations...');
@@ -75,7 +72,8 @@ export const main = async () => {
         console.log(`   Run health check: ${colors.cyan}npm run health-check${colors.reset}\n`);
         
         await connectDB();
-        Logger.startup(USER_ADDRESSES, PROXY_WALLET);
+        Logger.info(`\n🤖 ARB BOT`);
+        Logger.info(`Wallet: ${PROXY_WALLET}`);
 
         // Perform initial health check
         Logger.info('Performing initial health check...');
@@ -91,13 +89,8 @@ export const main = async () => {
         Logger.success('CLOB client ready');
 
         Logger.separator();
-        Logger.info('Starting trade monitor...');
-        tradeMonitor();
-
-        Logger.info('Starting trade executor...');
-        tradeExecutor(clobClient);
-
-        // test(clobClient);
+        Logger.info('Starting ARB BOT...');
+        arbExecutor(clobClient);
     } catch (error) {
         Logger.error(`Fatal error during startup: ${error}`);
         await gracefulShutdown('startup-error');
