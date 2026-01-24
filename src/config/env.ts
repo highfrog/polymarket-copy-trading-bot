@@ -350,4 +350,18 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    // Window Strategy settings
+    WINDOW_STRATEGY_ENABLED: process.env.WINDOW_STRATEGY_ENABLED === 'true',
+    WINDOW_STRATEGY_DRY_RUN: process.env.WINDOW_STRATEGY_DRY_RUN !== 'false', // Default true
+    WINDOW_STRATEGY_BALANCE: parseFloat(process.env.WINDOW_STRATEGY_BALANCE || '100'),
+    WINDOW_STRATEGY_INITIAL_BUY: parseFloat(process.env.WINDOW_STRATEGY_INITIAL_BUY || '5'),
+    WINDOW_STRATEGY_ENTRY_THRESHOLD: parseFloat(process.env.WINDOW_STRATEGY_ENTRY_THRESHOLD || '0.35'),
+    WINDOW_STRATEGY_OPPOSITE_THRESHOLD: parseFloat(process.env.WINDOW_STRATEGY_OPPOSITE_THRESHOLD || '0.50'),
+    WINDOW_STRATEGY_COMBINED_THRESHOLD: parseFloat(process.env.WINDOW_STRATEGY_COMBINED_THRESHOLD || '0.85'),
+    WINDOW_STRATEGY_HEDGE_MINUTES: parseFloat(process.env.WINDOW_STRATEGY_HEDGE_MINUTES || '5'),
+    // Sliding hedge threshold: starts at START with HEDGE_MINUTES left, increases by RAMP per minute, caps at MAX
+    WINDOW_STRATEGY_HEDGE_START: parseFloat(process.env.WINDOW_STRATEGY_HEDGE_START || '1.00'),
+    WINDOW_STRATEGY_HEDGE_RAMP: parseFloat(process.env.WINDOW_STRATEGY_HEDGE_RAMP || '0.05'),
+    WINDOW_STRATEGY_HEDGE_MAX: parseFloat(process.env.WINDOW_STRATEGY_HEDGE_MAX || '1.25'),
+    WINDOW_STRATEGY_COINS: (process.env.WINDOW_STRATEGY_COINS || 'btc,eth').split(',').map(c => c.trim().toLowerCase()),
 };

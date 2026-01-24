@@ -2,6 +2,7 @@ import connectDB, { closeDB } from './config/db';
 import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
 import arbExecutor, { stopArbExecutor } from './services/arbExecutor';
+import windowStrategy, { stopWindowStrategy } from './services/windowStrategy';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 
@@ -23,6 +24,7 @@ const gracefulShutdown = async (signal: string) => {
     try {
         // Stop services
         stopArbExecutor();
+        stopWindowStrategy();
 
         // Give services time to finish current operations
         Logger.info('Waiting for services to finish current operations...');
@@ -89,8 +91,15 @@ export const main = async () => {
         Logger.success('CLOB client ready');
 
         Logger.separator();
-        Logger.info('Starting ARB BOT...');
-        arbExecutor(clobClient);
+
+        // Start enabled strategies
+        if (ENV.WINDOW_STRATEGY_ENABLED) {
+            Logger.info('Starting WINDOW STRATEGY...');
+            windowStrategy(clobClient);
+        } else {
+            Logger.info('Starting ARB BOT...');
+            arbExecutor(clobClient);
+        }
     } catch (error) {
         Logger.error(`Fatal error during startup: ${error}`);
         await gracefulShutdown('startup-error');
